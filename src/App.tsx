@@ -779,7 +779,7 @@ function App() {
         return;
       }
 
-      await providersApi.openTerminal(provider.id, activeApp, {
+      const openTerminalTask = providersApi.openTerminal(provider.id, activeApp, {
         cwd: selectedDir,
       });
       toast.success(
@@ -787,6 +787,7 @@ function App() {
           defaultValue: "终端已打开",
         }),
       );
+      await openTerminalTask;
     } catch (error) {
       console.error("[App] Failed to open terminal", error);
       const errorMessage = extractErrorMessage(error);

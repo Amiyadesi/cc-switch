@@ -2403,65 +2403,104 @@ pub async fn open_provider_terminal(
         .get(&providerId)
         .ok_or_else(|| format!("提供商 {providerId} 不存在"))?;
 
-    // 从提供商配置中提取环境变量
-    let config = &provider.settings_config;
-    let env_vars = extract_env_vars_from_config(config, &app_type);
+    // 从提供商配置中提取临时终端环境变量。
+    // 这些变量只注入到新打开的终端进程，不会修改当前全局 live 配置。
+    let env_vars = extract_env_vars_from_provider(provider, &app_type);
 
-    // 根据平台启动终端，传入提供商ID用于生成唯一的配置文件名
-    launch_terminal_with_env(env_vars, &providerId, launch_cwd.as_deref())
-        .map_err(|e| format!("启动终端失败: {e}"))?;
+    // 根据平台启动终端，传入提供商信息用于生成临时配置与终端提示。
+    launch_terminal_with_env(
+        env_vars,
+        &providerId,
+        &provider.name,
+        &app_type,
+        launch_cwd.as_deref(),
+    )
+    .map_err(|e| format!("启动终端失败: {e}"))?;
 
     Ok(true)
 }
 
-/// 从提供商配置中提取环境变量
-fn extract_env_vars_from_config(
-    config: &serde_json::Value,
+/// 从提供商配置中提取临时终端环境变量。
+///
+/// 不同应用的供应商配置形态不一致：Claude/Gemini 主要来自 `env`，
+/// Codex/OpenCode/OpenClaw/Hermes 则可能把 key/url 放在顶层、`auth` 或
+/// `options` 中。这里统一投影为常见 CLI/SDK 能识别的环境变量，确保
+/// “打开终端”只影响新终端的临时开发会话。
+fn extract_env_vars_from_provider(
+    provider: &crate::provider::Provider,
     app_type: &AppType,
 ) -> Vec<(String, String)> {
     let mut env_vars = Vec::new();
 
-    let Some(obj) = config.as_object() else {
-        return env_vars;
-    };
-
-    // 处理 env 字段（Claude/Gemini 通用）
-    if let Some(env) = obj.get("env").and_then(|v| v.as_object()) {
+    if let Some(env) = provider
+        .settings_config
+        .get("env")
+        .and_then(|v| v.as_object())
+    {
         for (key, value) in env {
             if let Some(str_val) = value.as_str() {
-                env_vars.push((key.clone(), str_val.to_string()));
-            }
-        }
-
-        // 处理 base_url: 根据应用类型添加对应的环境变量
-        let base_url_key = match app_type {
-            AppType::Claude | AppType::ClaudeDesktop => Some("ANTHROPIC_BASE_URL"),
-            AppType::Gemini => Some("GOOGLE_GEMINI_BASE_URL"),
-            _ => None,
-        };
-
-        if let Some(key) = base_url_key {
-            if let Some(url_str) = env.get(key).and_then(|v| v.as_str()) {
-                env_vars.push((key.to_string(), url_str.to_string()));
+                push_env_var(&mut env_vars, key, str_val);
             }
         }
     }
 
-    // Codex 使用 auth 字段转换为 OPENAI_API_KEY
-    if *app_type == AppType::Codex {
-        if let Some(auth) = obj.get("auth").and_then(|v| v.as_str()) {
-            env_vars.push(("OPENAI_API_KEY".to_string(), auth.to_string()));
-        }
-    }
+    let (base_url, api_key) = provider.resolve_usage_credentials(app_type);
 
-    // Gemini 使用 api_key 字段转换为 GEMINI_API_KEY
-    if *app_type == AppType::Gemini {
-        if let Some(api_key) = obj.get("api_key").and_then(|v| v.as_str()) {
-            env_vars.push(("GEMINI_API_KEY".to_string(), api_key.to_string()));
+    match app_type {
+        AppType::Claude | AppType::ClaudeDesktop => {
+            push_env_var_if_present(&mut env_vars, "ANTHROPIC_BASE_URL", &base_url);
+            if !has_any_env_var(
+                &env_vars,
+                &[
+                    "ANTHROPIC_AUTH_TOKEN",
+                    "ANTHROPIC_API_KEY",
+                    "OPENROUTER_API_KEY",
+                    "GOOGLE_API_KEY",
+                ],
+            ) {
+                push_env_var_if_present(&mut env_vars, "ANTHROPIC_API_KEY", &api_key);
+            }
+        }
+        AppType::Codex => {
+            push_env_var_if_present(&mut env_vars, "OPENAI_API_KEY", &api_key);
+            push_env_var_if_present(&mut env_vars, "OPENAI_BASE_URL", &base_url);
+        }
+        AppType::Gemini => {
+            push_env_var_if_present(&mut env_vars, "GOOGLE_GEMINI_BASE_URL", &base_url);
+            if !has_any_env_var(&env_vars, &["GEMINI_API_KEY", "GOOGLE_API_KEY"]) {
+                push_env_var_if_present(&mut env_vars, "GEMINI_API_KEY", &api_key);
+            }
+        }
+        AppType::OpenCode | AppType::OpenClaw | AppType::Hermes => {
+            push_env_var_if_present(&mut env_vars, "OPENAI_API_KEY", &api_key);
+            push_env_var_if_present(&mut env_vars, "OPENAI_BASE_URL", &base_url);
+            push_env_var_if_present(&mut env_vars, "BASE_URL", &base_url);
         }
     }
 
     env_vars
+}
+
+fn push_env_var_if_present(env_vars: &mut Vec<(String, String)>, key: &str, value: &str) {
+    if !value.trim().is_empty() {
+        push_env_var(env_vars, key, value);
+    }
+}
+
+fn push_env_var(env_vars: &mut Vec<(String, String)>, key: &str, value: &str) {
+    if let Some((_, existing)) = env_vars.iter_mut().find(|(env_key, _)| env_key == key) {
+        *existing = value.to_string();
+    } else {
+        env_vars.push((key.to_string(), value.to_string()));
+    }
+}
+
+fn has_any_env_var(env_vars: &[(String, String)], keys: &[&str]) -> bool {
+    keys.iter().any(|key| {
+        env_vars
+            .iter()
+            .any(|(env_key, value)| env_key == key && !value.trim().is_empty())
+    })
 }
 
 fn resolve_launch_cwd(cwd: Option<String>) -> Result<Option<PathBuf>, String> {
@@ -2501,43 +2540,81 @@ fn resolve_launch_cwd(cwd: Option<String>) -> Result<Option<PathBuf>, String> {
     Ok(Some(resolved))
 }
 
-/// 创建临时配置文件并启动 claude 终端
-/// 使用 --settings 参数传入提供商特定的 API 配置
+/// 创建临时配置文件并启动带供应商环境的终端。
+///
+/// 临时 key/base URL 只写入新终端进程的环境变量；Claude 额外生成
+/// `--settings` JSON，以保持既有 Claude Code 兼容性。
 fn launch_terminal_with_env(
     env_vars: Vec<(String, String)>,
     provider_id: &str,
+    provider_name: &str,
+    app_type: &AppType,
     cwd: Option<&Path>,
 ) -> Result<(), String> {
     let temp_dir = std::env::temp_dir();
+    let safe_provider_id = sanitize_temp_file_component(provider_id);
     let config_file = temp_dir.join(format!(
-        "claude_{}_{}.json",
-        provider_id,
-        std::process::id()
+        "cc_switch_{}_{}_{}_settings.json",
+        app_type.as_str(),
+        safe_provider_id,
+        std::process::id(),
     ));
 
-    // 创建并写入配置文件
+    // 创建并写入配置文件；非 Claude 终端也会复用该文件作为可见的临时环境快照。
     write_claude_config(&config_file, &env_vars)?;
 
     #[cfg(target_os = "macos")]
     {
-        launch_macos_terminal(&config_file, cwd)?;
+        launch_macos_terminal(
+            &config_file,
+            &env_vars,
+            provider_id,
+            provider_name,
+            app_type,
+            cwd,
+        )?;
         Ok(())
     }
 
     #[cfg(target_os = "linux")]
     {
-        launch_linux_terminal(&config_file, cwd)?;
+        launch_linux_terminal(
+            &config_file,
+            &env_vars,
+            provider_id,
+            provider_name,
+            app_type,
+            cwd,
+        )?;
         Ok(())
     }
 
     #[cfg(target_os = "windows")]
     {
-        launch_windows_terminal(&temp_dir, &config_file, cwd)?;
+        launch_windows_terminal(
+            &temp_dir,
+            &config_file,
+            &env_vars,
+            provider_id,
+            provider_name,
+            app_type,
+            cwd,
+        )?;
         return Ok(());
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-    Err("不支持的操作系统".to_string())
+    {
+        let _ = (
+            env_vars,
+            provider_id,
+            provider_name,
+            app_type,
+            cwd,
+            config_file,
+        );
+        Err("不支持的操作系统".to_string())
+    }
 }
 
 /// 写入 claude 配置文件
@@ -2560,9 +2637,164 @@ fn write_claude_config(
     std::fs::write(config_file, config_json).map_err(|e| format!("写入配置文件失败: {e}"))
 }
 
+fn sanitize_temp_file_component(value: &str) -> String {
+    let sanitized: String = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+
+    if sanitized.is_empty() {
+        "provider".to_string()
+    } else {
+        sanitized
+    }
+}
+
+fn terminal_cli_command(app_type: &AppType, config_file: &std::path::Path) -> String {
+    match app_type {
+        AppType::Claude | AppType::ClaudeDesktop => format!(
+            "claude --settings {}",
+            shell_single_quote(&config_file.to_string_lossy())
+        ),
+        AppType::Codex => "codex".to_string(),
+        AppType::Gemini => "gemini".to_string(),
+        AppType::OpenCode => "opencode".to_string(),
+        AppType::OpenClaw => "openclaw".to_string(),
+        AppType::Hermes => "hermes".to_string(),
+    }
+}
+
+fn terminal_cli_binary(app_type: &AppType) -> &'static str {
+    match app_type {
+        AppType::Claude | AppType::ClaudeDesktop => "claude",
+        AppType::Codex => "codex",
+        AppType::Gemini => "gemini",
+        AppType::OpenCode => "opencode",
+        AppType::OpenClaw => "openclaw",
+        AppType::Hermes => "hermes",
+    }
+}
+
+fn build_shell_env_exports(env_vars: &[(String, String)]) -> String {
+    env_vars
+        .iter()
+        .map(|(key, value)| format!("export {}={}\n", key, shell_single_quote(value)))
+        .collect()
+}
+
+fn build_shell_terminal_summary(
+    env_vars: &[(String, String)],
+    provider_id: &str,
+    provider_name: &str,
+    app_type: &AppType,
+    config_file: &std::path::Path,
+) -> String {
+    let mut lines = vec![
+        "echo \"[cc-switch] 临时供应商终端已就绪\"".to_string(),
+        format!(
+            "echo \"App: {}\"",
+            shell_double_quote_for_echo(app_type.as_str())
+        ),
+        format!(
+            "echo \"Provider: {} ({})\"",
+            shell_double_quote_for_echo(provider_name),
+            shell_double_quote_for_echo(provider_id)
+        ),
+        format!(
+            "echo \"Temp settings: {}\"",
+            shell_double_quote_for_echo(&config_file.to_string_lossy())
+        ),
+    ];
+
+    for (key, value) in summarized_env_vars(env_vars) {
+        lines.push(format!(
+            "echo \"{}={}\"",
+            shell_double_quote_for_echo(&key),
+            shell_double_quote_for_echo(&value)
+        ));
+    }
+
+    lines.push("echo \"临时 key/base URL 已注入本终端环境，不会修改全局 live 配置。\"".to_string());
+    lines.push("echo \"关闭此终端即可结束临时供应商会话。\"".to_string());
+    lines.join("\n")
+}
+
+fn build_shell_cli_launch(app_type: &AppType, config_file: &std::path::Path) -> String {
+    let binary = terminal_cli_binary(app_type);
+    let command = terminal_cli_command(app_type, config_file);
+    format!(
+        r#"if command -v {binary} >/dev/null 2>&1; then
+    echo ""
+    echo "[cc-switch] Starting {binary} with temporary provider environment..."
+    {command}
+else
+    echo ""
+    echo "[cc-switch] {binary} command not found. The temporary provider environment is ready in this shell."
+fi"#,
+        binary = binary,
+        command = command,
+    )
+}
+
+fn summarized_env_vars(env_vars: &[(String, String)]) -> Vec<(String, String)> {
+    env_vars
+        .iter()
+        .filter(|(_, value)| !value.trim().is_empty())
+        .map(|(key, value)| {
+            let summary = if is_secret_env_key(key) {
+                mask_secret(value)
+            } else {
+                value.to_string()
+            };
+            (key.clone(), summary)
+        })
+        .collect()
+}
+
+fn is_secret_env_key(key: &str) -> bool {
+    let upper = key.to_ascii_uppercase();
+    upper.contains("KEY") || upper.contains("TOKEN") || upper.contains("SECRET")
+}
+
+fn mask_secret(value: &str) -> String {
+    let value = value.trim();
+    if value.is_empty() {
+        return String::new();
+    }
+
+    let char_count = value.chars().count();
+    let suffix_len = char_count.min(4);
+    let suffix: String = value
+        .chars()
+        .skip(char_count.saturating_sub(suffix_len))
+        .collect();
+    format!("****{suffix}")
+}
+
+fn shell_double_quote_for_echo(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('$', "\\$")
+        .replace('`', "\\`")
+}
+
 /// macOS: 根据用户首选终端启动
 #[cfg(target_os = "macos")]
-fn launch_macos_terminal(config_file: &std::path::Path, cwd: Option<&Path>) -> Result<(), String> {
+fn launch_macos_terminal(
+    config_file: &std::path::Path,
+    env_vars: &[(String, String)],
+    provider_id: &str,
+    provider_name: &str,
+    app_type: &AppType,
+    cwd: Option<&Path>,
+) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
 
     let preferred = crate::settings::get_preferred_terminal();
@@ -2572,20 +2804,26 @@ fn launch_macos_terminal(config_file: &std::path::Path, cwd: Option<&Path>) -> R
     let script_file = temp_dir.join(format!("cc_switch_launcher_{}.sh", std::process::id()));
     let config_path = config_file.to_string_lossy();
     let cd_command = build_shell_cd_command(cwd);
+    let env_exports = build_shell_env_exports(env_vars);
+    let summary =
+        build_shell_terminal_summary(env_vars, provider_id, provider_name, app_type, config_file);
+    let cli_launch = build_shell_cli_launch(app_type, config_file);
 
     // Write the shell script to a temp file
     let script_content = format!(
         r#"#!/bin/bash
 trap 'rm -f "{config_path}" "{script_file}"' EXIT
-{cd_command}
-echo "Using provider-specific claude config:"
-echo "{config_path}"
-claude --settings "{config_path}"
+{cd_command}{env_exports}
+{summary}
+{cli_launch}
 exec bash --norc --noprofile
 "#,
         config_path = config_path,
         script_file = script_file.display(),
         cd_command = cd_command,
+        env_exports = env_exports,
+        summary = summary,
+        cli_launch = cli_launch,
     );
 
     std::fs::write(&script_file, &script_content).map_err(|e| format!("写入启动脚本失败: {e}"))?;
@@ -2829,7 +3067,14 @@ fn launch_macos_warp(script_file: &std::path::Path) -> Result<(), String> {
 
 /// Linux: 根据用户首选终端启动
 #[cfg(target_os = "linux")]
-fn launch_linux_terminal(config_file: &std::path::Path, cwd: Option<&Path>) -> Result<(), String> {
+fn launch_linux_terminal(
+    config_file: &std::path::Path,
+    env_vars: &[(String, String)],
+    provider_id: &str,
+    provider_name: &str,
+    app_type: &AppType,
+    cwd: Option<&Path>,
+) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
 
@@ -2852,19 +3097,25 @@ fn launch_linux_terminal(config_file: &std::path::Path, cwd: Option<&Path>) -> R
     let script_file = temp_dir.join(format!("cc_switch_launcher_{}.sh", std::process::id()));
     let config_path = config_file.to_string_lossy();
     let cd_command = build_shell_cd_command(cwd);
+    let env_exports = build_shell_env_exports(env_vars);
+    let summary =
+        build_shell_terminal_summary(env_vars, provider_id, provider_name, app_type, config_file);
+    let cli_launch = build_shell_cli_launch(app_type, config_file);
 
     let script_content = format!(
         r#"#!/bin/bash
 trap 'rm -f "{config_path}" "{script_file}"' EXIT
-{cd_command}
-echo "Using provider-specific claude config:"
-echo "{config_path}"
-claude --settings "{config_path}"
+{cd_command}{env_exports}
+{summary}
+{cli_launch}
 exec bash --norc --noprofile
 "#,
         config_path = config_path,
         script_file = script_file.display(),
         cd_command = cd_command,
+        env_exports = env_exports,
+        summary = summary,
+        cli_launch = cli_launch,
     );
 
     std::fs::write(&script_file, &script_content).map_err(|e| format!("写入启动脚本失败: {e}"))?;
@@ -2943,28 +3194,40 @@ fn which_command(cmd: &str) -> bool {
 fn launch_windows_terminal(
     temp_dir: &std::path::Path,
     config_file: &std::path::Path,
+    env_vars: &[(String, String)],
+    provider_id: &str,
+    provider_name: &str,
+    app_type: &AppType,
     cwd: Option<&Path>,
 ) -> Result<(), String> {
     let preferred = crate::settings::get_preferred_terminal();
     let terminal = preferred.as_deref().unwrap_or("cmd");
 
-    let bat_file = temp_dir.join(format!("cc_switch_claude_{}.bat", std::process::id()));
+    let bat_file = temp_dir.join(format!(
+        "cc_switch_{}_{}.bat",
+        app_type.as_str(),
+        std::process::id()
+    ));
     let config_path_for_batch = escape_windows_batch_value(&config_file.to_string_lossy());
     let cwd_command = build_windows_cwd_command(cwd);
+    let env_sets = build_windows_env_sets(env_vars);
+    let summary =
+        build_windows_terminal_summary(env_vars, provider_id, provider_name, app_type, config_file);
+    let cli_launch = build_windows_cli_launch(app_type, config_file);
 
     let content = format!(
         "@echo off
-{cwd_command}
-echo Using provider-specific claude config:
-echo {}
-claude --settings \"{}\"
+{cwd_command}{env_sets}
+{summary}
+{cli_launch}
 del \"{}\" >nul 2>&1
 del \"%~f0\" >nul 2>&1
 ",
         config_path_for_batch,
-        config_path_for_batch,
-        config_path_for_batch,
         cwd_command = cwd_command,
+        env_sets = env_sets,
+        summary = summary,
+        cli_launch = cli_launch,
     );
 
     std::fs::write(&bat_file, &content).map_err(|e| format!("写入批处理文件失败: {e}"))?;
@@ -3030,6 +3293,70 @@ fn build_windows_cwd_command_str(path: &str) -> String {
 fn build_windows_cwd_command(cwd: Option<&Path>) -> String {
     cwd.map(|dir| build_windows_cwd_command_str(&dir.to_string_lossy()))
         .unwrap_or_default()
+}
+
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn build_windows_env_sets(env_vars: &[(String, String)]) -> String {
+    env_vars
+        .iter()
+        .map(|(key, value)| format!("set \"{}={}\"\r\n", key, escape_windows_batch_value(value)))
+        .collect()
+}
+
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn build_windows_terminal_summary(
+    env_vars: &[(String, String)],
+    provider_id: &str,
+    provider_name: &str,
+    app_type: &AppType,
+    config_file: &std::path::Path,
+) -> String {
+    let mut lines = vec![
+        "echo [cc-switch] 临时供应商终端已就绪".to_string(),
+        format!(
+            "echo App: {}",
+            escape_windows_batch_value(app_type.as_str())
+        ),
+        format!(
+            "echo Provider: {} ({})",
+            escape_windows_batch_value(provider_name),
+            escape_windows_batch_value(provider_id)
+        ),
+        format!(
+            "echo Temp settings: {}",
+            escape_windows_batch_value(&config_file.to_string_lossy())
+        ),
+    ];
+
+    for (key, value) in summarized_env_vars(env_vars) {
+        lines.push(format!(
+            "echo {}={}",
+            escape_windows_batch_value(&key),
+            escape_windows_batch_value(&value)
+        ));
+    }
+
+    lines.push("echo 临时 key/base URL 已注入本终端环境，不会修改全局 live 配置。".to_string());
+    lines.push("echo 关闭此终端即可结束临时供应商会话。".to_string());
+    lines.join("\r\n")
+}
+
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn build_windows_cli_launch(app_type: &AppType, config_file: &std::path::Path) -> String {
+    let binary = terminal_cli_binary(app_type);
+    let command = match app_type {
+        AppType::Claude | AppType::ClaudeDesktop => format!(
+            "claude --settings \"{}\"",
+            escape_windows_batch_value(&config_file.to_string_lossy())
+        ),
+        _ => binary.to_string(),
+    };
+
+    format!(
+        "where {binary} >nul 2>&1\r\nif %ERRORLEVEL% EQU 0 (\r\n  echo.\r\n  echo [cc-switch] Starting {binary} with temporary provider environment...\r\n  {command}\r\n) else (\r\n  echo.\r\n  echo [cc-switch] {binary} command not found. The temporary provider environment is ready in this shell.\r\n)",
+        binary = binary,
+        command = command,
+    )
 }
 
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
@@ -4654,6 +4981,38 @@ mod tests {
         let command = build_shell_cd_command(Some(Path::new("/tmp/project O'Brien")));
 
         assert_eq!(command, "cd '/tmp/project O'\"'\"'Brien' || exit 1\n");
+    }
+
+    #[test]
+    fn terminal_env_extraction_projects_codex_credentials() {
+        let provider = crate::provider::Provider::with_id(
+            "codex-alt".to_string(),
+            "Codex Alt".to_string(),
+            serde_json::json!({
+                "auth": { "OPENAI_API_KEY": "sk-test-1234" },
+                "config": "model_provider = 'custom'\n[model_providers.custom]\nbase_url = 'https://api.example.com/v1'\n",
+            }),
+            None,
+        );
+
+        let env_vars = extract_env_vars_from_provider(&provider, &AppType::Codex);
+
+        assert!(env_vars.contains(&("OPENAI_API_KEY".to_string(), "sk-test-1234".to_string())));
+        assert!(env_vars.contains(&(
+            "OPENAI_BASE_URL".to_string(),
+            "https://api.example.com/v1".to_string(),
+        )));
+    }
+
+    #[test]
+    fn terminal_summary_masks_secret_values() {
+        let summary =
+            summarized_env_vars(&[("OPENAI_API_KEY".to_string(), "sk-secret-abcdef".to_string())]);
+
+        assert_eq!(
+            summary,
+            vec![("OPENAI_API_KEY".to_string(), "****cdef".to_string())]
+        );
     }
 
     #[cfg(target_os = "macos")]
